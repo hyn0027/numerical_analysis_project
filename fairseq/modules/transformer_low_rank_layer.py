@@ -45,6 +45,8 @@ class TransformerLowRankEncoderLayerBase(TransformerEncoderLayerBase):
                 q_noise=self.quant_noise,
                 qn_block_size=self.quant_noise_block_size,
                 xformers_att_config=cfg.encoder.xformers_att_config,
+                low_rank_threshold=cfg.low_rank_threshold,
+                low_rank_scale=cfg.low_rank_scale,
             )
         elif cfg.low_rank == "PCA":
             return PCAMultiheadAttention(
@@ -55,6 +57,8 @@ class TransformerLowRankEncoderLayerBase(TransformerEncoderLayerBase):
                 q_noise=self.quant_noise,
                 qn_block_size=self.quant_noise_block_size,
                 xformers_att_config=cfg.encoder.xformers_att_config,
+                low_rank_threshold=cfg.low_rank_threshold,
+                low_rank_scale=cfg.low_rank_scale,
             )
         else:
             raise Exception("This low rank method ahs not been implemented yet!")
@@ -107,6 +111,8 @@ class TransformerLowRankDecoderLayerBase(TransformerDecoderLayerBase):
                 q_noise=self.quant_noise,
                 qn_block_size=self.quant_noise_block_size,
                 xformers_att_config=cfg.decoder.xformers_att_config,
+                low_rank_threshold=cfg.low_rank_threshold,
+                low_rank_scale=cfg.low_rank_scale,
             )
         elif cfg.low_rank == "PCA":
             return PCAMultiheadAttention(
@@ -119,6 +125,8 @@ class TransformerLowRankDecoderLayerBase(TransformerDecoderLayerBase):
                 q_noise=self.quant_noise,
                 qn_block_size=self.quant_noise_block_size,
                 xformers_att_config=cfg.decoder.xformers_att_config,
+                low_rank_threshold=cfg.low_rank_threshold,
+                low_rank_scale=cfg.low_rank_scale,
             )
         else:
             raise Exception("This low rank method ahs not been implemented yet!")
@@ -431,6 +439,8 @@ class SVDMultiheadAttention(MultiheadAttention):
         xformers_blocksparse_blocksize: Optional[
             int
         ] = 16,  # This should be part of the config
+        low_rank_threshold = 128,
+        low_rank_scale = 0.25,
     ):
         super().__init__(
             embed_dim,
@@ -450,8 +460,8 @@ class SVDMultiheadAttention(MultiheadAttention):
             xformers_blocksparse_layout,
             xformers_blocksparse_blocksize
         )
-        self.cnt_small = 0
-        self.cnt_large = 0
+        self.low_rank_threshold = low_rank_threshold
+        self.low_rank_scale = low_rank_scale
     
     def forward(
         self,
@@ -663,15 +673,15 @@ class SVDMultiheadAttention(MultiheadAttention):
         if self.encoder_decoder_attention and bsz != kv_bsz:
             raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
         else:
-            if attn_probs.size(1) > 100:
+            if attn_probs.size(1) > self.low_rank_threshold:
                 U, S, Vh = torch.linalg.svd(attn_probs, full_matrices=False)
-                U = U[:, :, :50]
-                S = S[:, :50]
-                Vh = Vh[:, :50, :]
+                lim = int(self.low_rank_scale)
+                U = U[:, :, :lim]
+                S = S[:, :lim]
+                Vh = Vh[:, :lim, :]
+                Vh = (Vh.transpose(1, 2)*S[:, None]).transpose(1, 2)
                 attn = torch.bmm(Vh, v)
-                attn = (attn.transpose(1, 2)*S[:, None]).transpose(1, 2)
                 attn = torch.bmm(U, attn)
-                print(1)
             else:
                 attn = torch.bmm(attn_probs, v)
         assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
@@ -722,6 +732,8 @@ class PCAMultiheadAttention(MultiheadAttention):
         xformers_blocksparse_blocksize: Optional[
             int
         ] = 16,  # This should be part of the config
+        low_rank_threshold = 128,
+        low_rank_scale = 0.25,
     ):
         super().__init__(
             embed_dim,
@@ -741,9 +753,9 @@ class PCAMultiheadAttention(MultiheadAttention):
             xformers_blocksparse_layout,
             xformers_blocksparse_blocksize
         )
-        self.cnt_small = 0
-        self.cnt_large = 0
-    
+        self.low_rank_threshold = low_rank_threshold
+        self.low_rank_scale = low_rank_scale
+
     def forward(
         self,
         query: Tensor,
@@ -954,13 +966,11 @@ class PCAMultiheadAttention(MultiheadAttention):
         if self.encoder_decoder_attention and bsz != kv_bsz:
             raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
         else:
-            if attn_probs.size(1) > 100:
-                U, S, V = torch.pca_lowrank(attn_probs, 50)
-                Vh = V.transpose(1, 2)
-                attn = torch.bmm(Vh, v)
-                attn = (attn.transpose(1, 2)*S[:, None]).transpose(1, 2)
+            if attn_probs.size(1) > self.low_rank_threshold:
+                U, S, V = torch.pca_lowrank(attn_probs, int(self.low_rank_scale))
+                V = (V*S[:, None]).transpose(1, 2)
+                attn = torch.bmm(V, v)
                 attn = torch.bmm(U, attn)
-                print(1)
             else:
                 attn = torch.bmm(attn_probs, v)
         assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
