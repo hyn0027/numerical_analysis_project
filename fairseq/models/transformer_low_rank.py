@@ -33,6 +33,9 @@ from fairseq.modules import AdaptiveInput, CharacterTokenEmbedder
 
 @dataclass
 class TransformerLanguageModelConfig(FairseqDataclass):
+    tokens_per_sample: int = field(
+        default=512, metadata={"help":"tokens per sample"}
+    )
     low_rank_threshold: int = field(
         default=128, metadata={"help":"the threshold for low rank matrix approximation"}
     )
@@ -383,6 +386,9 @@ class TransformerLowRankConfig(TransformerConfig):
     )
     low_rank_scale: float = field(
         default=0.25, metadata={"help":"the scale for low rank matrix approximation"}
+    )
+    tokens_per_sample: int = field(
+        default=512, metadata={"help":"tokens per sample"}
     )
 
 class TransformerLowRankDecoder(TransformerLowRankDecoderBase):
