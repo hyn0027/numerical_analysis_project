@@ -75,6 +75,16 @@ class TransformerLowRankEncoderLayerBase(TransformerEncoderLayerBase):
                 xformers_att_config=cfg.encoder.xformers_att_config,
                 liner_proj=self.linear_proj,
             )
+        elif cfg.low_rank == "LinearTransformer":
+            return LinearTransformerMultiheadAttention(
+                embed_dim,
+                cfg.encoder.attention_heads,
+                dropout=cfg.attention_dropout,
+                self_attention=True,
+                q_noise=self.quant_noise,
+                qn_block_size=self.quant_noise_block_size,
+                xformers_att_config=cfg.encoder.xformers_att_config,
+            )
         else:
             raise Exception("This low rank method ahs not been implemented yet!")
 
@@ -158,6 +168,18 @@ class TransformerLowRankDecoderLayerBase(TransformerDecoderLayerBase):
                 qn_block_size=self.quant_noise_block_size,
                 xformers_att_config=cfg.decoder.xformers_att_config,
                 liner_proj=self.linear_proj,
+            )
+        elif cfg.low_rank == "LinearTransformer":
+            return LinearTransformerMultiheadAttention(
+                embed_dim,
+                cfg.decoder.attention_heads,
+                dropout=cfg.attention_dropout,
+                add_bias_kv=add_bias_kv,
+                add_zero_attn=add_zero_attn,
+                self_attention=not cfg.cross_self_attention,
+                q_noise=self.quant_noise,
+                qn_block_size=self.quant_noise_block_size,
+                xformers_att_config=cfg.decoder.xformers_att_config,
             )
         else:
             raise Exception("This low rank method ahs not been implemented yet!")
@@ -1227,19 +1249,25 @@ class LinformerMultiheadAttention(MultiheadAttention):
 
         # This is part of a workaround to get around fork/join parallelism
         # not supporting Optional types.
-        if key_padding_mask is not None and key_padding_mask.dim() == 0:
-            key_padding_mask = None
+        # if key_padding_mask is not None and key_padding_mask.dim() == 0:
+        #     key_padding_mask = None
 
-        if key_padding_mask is not None:
-            assert key_padding_mask.size(0) == kv_bsz
-            assert key_padding_mask.size(1) == src_len
+        # if key_padding_mask is not None:
+        #     assert key_padding_mask.size(0) == kv_bsz
+        #     assert key_padding_mask.size(1) == src_len
 
         if self.add_zero_attn:
             assert v is not None
             src_len += 1
-            k, v, key_padding_mask, attn_mask = self._append_zero_attn(
-                k=k, v=v, key_padding_mask=key_padding_mask, attn_mask=attn_mask
-            )
+            k = torch.cat([k, k.new_zeros((k.size(0), 1) + k.size()[2:])], dim=1)
+            v = torch.cat([v, v.new_zeros((v.size(0), 1) + v.size()[2:])], dim=1)
+            if attn_mask is not None:
+                attn_mask = torch.cat(
+                    [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
+                )
+            # k, v, key_padding_mask, attn_mask = self._append_zero_attn(
+            #     k=k, v=v, key_padding_mask=key_padding_mask, attn_mask=attn_mask
+            # )
             
         if self.encoder_decoder_attention and bsz != kv_bsz:
             raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
@@ -1256,25 +1284,25 @@ class LinformerMultiheadAttention(MultiheadAttention):
         #         attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
         #     attn_weights += attn_mask
 
-        if key_padding_mask is not None:
-            # don't attend to padding symbols
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            if not is_tpu:
-                attn_weights = attn_weights.view(
-                    kv_bsz, -1, self.num_heads, tgt_len, src_len
-                )
-                attn_weights = attn_weights.masked_fill(
-                    key_padding_mask.unsqueeze(1)
-                    .unsqueeze(2)
-                    .unsqueeze(3)
-                    .to(torch.bool),
-                    float("-inf"),
-                )
-            else:
-                attn_weights = attn_weights.transpose(0, 2)
-                attn_weights = attn_weights.masked_fill(key_padding_mask, float("-inf"))
-                attn_weights = attn_weights.transpose(0, 2)
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+        # if key_padding_mask is not None:
+        #     # don't attend to padding symbols
+        #     attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+        #     if not is_tpu:
+        #         attn_weights = attn_weights.view(
+        #             kv_bsz, -1, self.num_heads, tgt_len, src_len
+        #         )
+        #         attn_weights = attn_weights.masked_fill(
+        #             key_padding_mask.unsqueeze(1)
+        #             .unsqueeze(2)
+        #             .unsqueeze(3)
+        #             .to(torch.bool),
+        #             float("-inf"),
+        #         )
+        #     else:
+        #         attn_weights = attn_weights.transpose(0, 2)
+        #         attn_weights = attn_weights.masked_fill(key_padding_mask, float("-inf"))
+        #         attn_weights = attn_weights.transpose(0, 2)
+        #     attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         if before_softmax:
             raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
@@ -1357,6 +1385,7 @@ class LinearTransformerMultiheadAttention(MultiheadAttention):
             xformers_blocksparse_layout,
             xformers_blocksparse_blocksize
         )
+        self.elu = nn.ELU()
     
     def forward(
         self,
@@ -1520,56 +1549,59 @@ class LinearTransformerMultiheadAttention(MultiheadAttention):
                 k=k, v=v, key_padding_mask=key_padding_mask, attn_mask=attn_mask
             )
 
-        if self.encoder_decoder_attention and bsz != kv_bsz:
-            raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
-        else:
-            attn_weights = torch.bmm(q, k.transpose(1, 2))
-        attn_weights = self.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
+        # if self.encoder_decoder_attention and bsz != kv_bsz:
+        #     raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
+        # else:
+        #     attn_weights = torch.bmm(q, k.transpose(1, 2))
+        # attn_weights = self.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
 
-        assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
+        # assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
-        if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(0)
-            if self.onnx_trace:
-                attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
-            attn_weights += attn_mask
+        # if attn_mask is not None:
+        #     attn_mask = attn_mask.unsqueeze(0)
+        #     if self.onnx_trace:
+        #         attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
+        #     attn_weights += attn_mask
 
-        if key_padding_mask is not None:
-            # don't attend to padding symbols
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            if not is_tpu:
-                attn_weights = attn_weights.view(
-                    kv_bsz, -1, self.num_heads, tgt_len, src_len
-                )
-                attn_weights = attn_weights.masked_fill(
-                    key_padding_mask.unsqueeze(1)
-                    .unsqueeze(2)
-                    .unsqueeze(3)
-                    .to(torch.bool),
-                    float("-inf"),
-                )
-            else:
-                attn_weights = attn_weights.transpose(0, 2)
-                attn_weights = attn_weights.masked_fill(key_padding_mask, float("-inf"))
-                attn_weights = attn_weights.transpose(0, 2)
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+        # if key_padding_mask is not None:
+        #     # don't attend to padding symbols
+        #     attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+        #     if not is_tpu:
+        #         attn_weights = attn_weights.view(
+        #             kv_bsz, -1, self.num_heads, tgt_len, src_len
+        #         )
+        #         attn_weights = attn_weights.masked_fill(
+        #             key_padding_mask.unsqueeze(1)
+        #             .unsqueeze(2)
+        #             .unsqueeze(3)
+        #             .to(torch.bool),
+        #             float("-inf"),
+        #         )
+        #     else:
+        #         attn_weights = attn_weights.transpose(0, 2)
+        #         attn_weights = attn_weights.masked_fill(key_padding_mask, float("-inf"))
+        #         attn_weights = attn_weights.transpose(0, 2)
+        #     attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-        if before_softmax:
-            raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
+        # if before_softmax:
+        #     raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
 
-        attn_weights_float = utils.softmax(
-            attn_weights, dim=-1, onnx_trace=self.onnx_trace
-        )
-        attn_weights = attn_weights_float.type_as(attn_weights)
-        attn_probs = self.dropout_module(attn_weights)
+        # attn_weights_float = utils.softmax(
+        #     attn_weights, dim=-1, onnx_trace=self.onnx_trace
+        # )
+        # attn_weights = attn_weights_float.type_as(attn_weights)
+        # attn_probs = self.dropout_module(attn_weights)
+
+        attn = torch.bmm(self.elu(k).transpose(1, 2), v)
+        attn = torch.bmm(self.elu(q), attn)
 
         assert v is not None
-        attn: Optional[Tensor] = None
-        if self.encoder_decoder_attention and bsz != kv_bsz:
-            raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
-        else:
-            attn = torch.bmm(attn_probs, v)
-        assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
+        # attn: Optional[Tensor] = None
+        # if self.encoder_decoder_attention and bsz != kv_bsz:
+        #     raise Exception("not implemented at /fairseq/modules/transformer_low_rank_layer.py")
+        # else:
+        #     attn = torch.bmm(attn_probs, v)
+        # assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
         if self.onnx_trace and attn.size(1) == 1:
             # when ONNX tracing a single decoder step (sequence length == 1)
             # the transpose is a no-op copy before view, thus unnecessary
@@ -1577,13 +1609,13 @@ class LinearTransformerMultiheadAttention(MultiheadAttention):
         else:
             attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, self.embed_dim)
         attn = self.out_proj(attn)
-        attn_weights: Optional[Tensor] = None
-        if need_weights:
-            attn_weights = attn_weights_float.view(
-                bsz, self.num_heads, tgt_len, src_len
-            ).transpose(1, 0)
-            if not need_head_weights:
-                # average attention weights over heads
-                attn_weights = attn_weights.mean(dim=0)
+        # attn_weights: Optional[Tensor] = None
+        # if need_weights:
+        #     attn_weights = attn_weights_float.view(
+        #         bsz, self.num_heads, tgt_len, src_len
+        #     ).transpose(1, 0)
+        #     if not need_head_weights:
+        #         # average attention weights over heads
+        #         attn_weights = attn_weights.mean(dim=0)
 
-        return attn, attn_weights
+        return attn, None
